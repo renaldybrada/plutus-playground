@@ -5,6 +5,9 @@
 -- If player 2 win (for example : player 1 lock 'paper' and player 2 challenge with 'scissor') then the fund goes to challenger (player 2)
 -- If it isn't (either challenger lose or draw), the fund stay locked on utxo.
 
+-- please visit https://github.com/renaldybrada/plutus-playground 
+-- for more information about simulation 
+
 import Control.Monad (void)
 import Data.ByteString.Char8 qualified as C
 import Data.Map (Map)
