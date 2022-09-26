@@ -1,186 +1,150 @@
-{-# LANGUAGE DataKinds           #-}
-{-# LANGUAGE DeriveAnyClass      #-}
-{-# LANGUAGE DeriveGeneric       #-}
-{-# LANGUAGE FlexibleContexts    #-}
-{-# LANGUAGE NoImplicitPrelude   #-}
-{-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TemplateHaskell     #-}
-{-# LANGUAGE TypeApplications    #-}
-{-# LANGUAGE TypeFamilies        #-}
-{-# LANGUAGE TypeOperators       #-}
+-- A simple Rock Paper Scissor game. This script adapted and extended from plutus guess game.
+-- This simple game only accept string input rock/paper/scissor. If player 1 or player 2 input others, the fund stay locked on utxo.
+-- Just like a typical rock paper scissor game, player or wallet 1 lock RPS word and some amount.
+-- player or wallet 2 try to challenge from player 1. 
+-- If player 2 win (for example : player 1 lock 'paper' and player 2 challenge with 'scissor') then the fund goes to challenger (player 2)
+-- If it isn't (either challenger lose or draw), the fund stay locked on utxo.
 
-{-# OPTIONS_GHC -fno-warn-unused-imports #-}
+import Control.Monad (void)
+import Data.ByteString.Char8 qualified as C
+import Data.Map (Map)
+import Data.Map qualified as Map
+import Data.Maybe (catMaybes)
+import Ledger (Address, Datum (Datum), ScriptContext, Validator, Value)
+import Ledger qualified
+import Ledger.Ada qualified as Ada
+import Ledger.Constraints qualified as Constraints
+import Ledger.Tx (ChainIndexTxOut (..))
+import Ledger.Typed.Scripts qualified as Scripts
+import Playground.Contract
+import Plutus.Contract
+import PlutusTx qualified
+import PlutusTx.Prelude hiding (pure, (<$>))
+import Prelude qualified as Haskell
 
-module Week04.Vesting where
+------------------------------------------------------------
 
-import           Control.Monad        hiding (fmap)
-import           Data.Aeson           (ToJSON, FromJSON)
-import           Data.Map             as Map
-import           Data.Text            (Text)
-import           Data.Void            (Void)
-import           Data.Char            as Char
-import           GHC.Generics         (Generic)
-import           Plutus.Contract
-import           PlutusTx             (Data (..))
-import qualified PlutusTx
-import           PlutusTx.Prelude     hiding (Semigroup(..), unless)
-import           Ledger               hiding (singleton)
-import           Ledger.Constraints   (TxConstraints)
-import qualified Ledger.Constraints   as Constraints
-import qualified Ledger.Typed.Scripts as Scripts
-import           Ledger.Ada           as Ada
-import           Playground.Contract  (printJson, printSchemas, ensureKnownCurrencies, stage, ToSchema)
-import           Playground.TH        (mkKnownCurrencies, mkSchemaDefinitions)
-import           Playground.Types     (KnownCurrency (..))
-import           Prelude              (IO, Semigroup (..), Show (..), String)
-import           Text.Printf          (printf)
+newtype HashedString = HashedString BuiltinByteString deriving newtype (PlutusTx.ToData, PlutusTx.FromData, PlutusTx.UnsafeFromData)
 
-data LockDatum = LockDatum
-    { beneficiary :: PaymentPubKeyHash
-    , deadline    :: POSIXTime
-    , lockRps     :: Integer
-    } deriving Show
+PlutusTx.makeLift ''HashedString
 
-PlutusTx.unstableMakeIsData ''LockDatum
+newtype ClearString = ClearString BuiltinByteString deriving newtype (PlutusTx.ToData, PlutusTx.FromData, PlutusTx.UnsafeFromData)
 
-{-# INLINABLE mkValidator #-}
-mkValidator :: LockDatum -> () -> ScriptContext -> Bool
-mkValidator dat () ctx = traceIfFalse "beneficiary's signature missing" signedByBeneficiary &&
-                         traceIfFalse "deadline not reached" deadlineReached
-  where
-    info :: TxInfo
-    info = scriptContextTxInfo ctx
+PlutusTx.makeLift ''ClearString
 
-    signedByBeneficiary :: Bool
-    signedByBeneficiary = txSignedBy info $ unPaymentPubKeyHash $ beneficiary dat
+type GameSchema =
+        Endpoint "1. lock" LockParams
+        .\/ Endpoint "2. challenge" ChallengeParams
 
-    deadlineReached :: Bool
-    deadlineReached = contains (from $ deadline dat) $ txInfoValidRange info
+data Game
+instance Scripts.ValidatorTypes Game where
+    type instance RedeemerType Game = ClearString
+    type instance DatumType Game = HashedString
 
-data SimpleRps
-instance Scripts.ValidatorTypes SimpleRps where
-    type instance DatumType SimpleRps = LockDatum
-    type instance RedeemerType SimpleRps = ()
+gameInstance :: Scripts.TypedValidator Game
+gameInstance = Scripts.mkTypedValidator @Game
+    $$(PlutusTx.compile [|| validateChallenge ||])
+    $$(PlutusTx.compile [|| wrap ||]) where
+        wrap = Scripts.wrapValidator @HashedString @ClearString
 
-typedValidator :: Scripts.TypedValidator SimpleRps
-typedValidator = Scripts.mkTypedValidator @SimpleRps
-    $$(PlutusTx.compile [|| mkValidator ||])
-    $$(PlutusTx.compile [|| wrap ||])
-  where
-    wrap = Scripts.wrapValidator @LockDatum @()
+-- create a data script for the rock paper scissor game by hashing the string
+-- and lifting the hash to its on-chain representation
+hashString :: Haskell.String -> HashedString
+hashString = HashedString . sha2_256 . toBuiltin . C.pack
 
-validator :: Validator
-validator = Scripts.validatorScript typedValidator
+-- create a redeemer script for the rock paper scissor game by lifting the
+-- string to its on-chain representation
+clearString :: Haskell.String -> ClearString
+clearString = ClearString . toBuiltin . C.pack
 
-valHash :: Ledger.ValidatorHash
-valHash = Scripts.validatorHash typedValidator
-
-scrAddress :: Ledger.Address
-scrAddress = scriptAddress validator
-
-data LockParams = LockParams
-    { gpBeneficiary :: !PaymentPubKeyHash
-    , gpDeadline    :: !POSIXTime
-    , gpAmount      :: !Integer
-    , gpRps         :: !Integer
-    } deriving (Generic, ToJSON, FromJSON, ToSchema)
-
-data ChallengeParams = ChallengeParams
-    { cAmount      :: !Integer
-    , cRps         :: !Integer
-    } deriving (Generic, ToJSON, FromJSON, ToSchema)
-
-type SimpleRpsSchema =
-            Endpoint "1.lock" LockParams
-        .\/ Endpoint "2.challenge" ChallengeParams
-        .\/ Endpoint "3.grab" ()
-
-lock :: AsContractError e => LockParams -> Contract w s e ()
-lock gp = do
-    let dat = LockDatum
-                { beneficiary = gpBeneficiary gp
-                , deadline    = gpDeadline gp
-                , lockRps     = gpRps gp
-                }
-        tx  = Constraints.mustPayToTheScript dat $ Ada.lovelaceValueOf $ gpAmount gp
-    ledgerTx <- submitTxConstraints typedValidator tx
-    void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
-    logInfo @String $ printf "lock a challenge with %d lovelace to %s with deadline %s"
-        (gpAmount gp)
-        (show $ gpBeneficiary gp)
-        (show $ gpDeadline gp)
-
-challenge :: forall w s e. AsContractError e => ChallengeParams -> Contract w s e ()
-challenge cParams = do
-    now   <- currentTime
-    pkh   <- ownPaymentPubKeyHash
-    utxos <- Map.filter (isSuitable pkh now) <$> utxosAt scrAddress
-    if Map.null utxos
-        then logInfo @String $ "no challenge available"
-        else do
-            let orefs   = fst <$> Map.toList utxos
-                lookups = Constraints.unspentOutputs utxos  <>
-                        Constraints.otherScript validator
-                tx :: TxConstraints Void Void
-                tx      = mconcat [Constraints.mustSpendScriptOutput oref unitRedeemer | oref <- orefs] <>
-                        Constraints.mustValidateIn (from now)
-            ledgerTx <- submitTxConstraintsWith @Void lookups tx
-            void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
-            logInfo @String $ "you win!"
-  where
-    isSuitable :: PaymentPubKeyHash -> POSIXTime -> ChainIndexTxOut -> Bool
-    isSuitable pkh now o = case _ciTxOutDatum o of
-        Left _          -> False
-        Right (Datum e) -> case PlutusTx.fromBuiltinData e of
-            Nothing -> False
-            Just d  -> beneficiary d == pkh && deadline d <= now && isChallengerWin (lockRps d) (cRps cParams)
+-- | The validation function (Datum -> Redeemer -> ScriptContext -> Bool)
+validateChallenge :: HashedString -> ClearString -> ScriptContext -> Bool
+validateChallenge hs cs _ = isChallengerWin hs cs
 
 -- Rock Paper Scissor Logic
--- 1 = Rock
--- 2 = Paper
--- 3 = Scissor
--- this function shows whether the challenger wins
--- draw is considered a loss, so it will return false when draw
-isChallengerWin :: Integer -> Integer -> Bool
-isChallengerWin lockInt cInt = 
-    if lockInt == 1 then -- ex : if lock == rock and challenger == paper  
-        if cInt == 2 then True else False -- then challenger win, otherwise the challenger loss even when it's draw
-    else if lockInt == 2 then
-        if cInt == 3 then True else False
-    else if lockInt == 3 then
-        if cInt == 1 then True else False
+-- this function shows whether the challenger wins.
+-- Draw is considered a loss, so it will return false when it is draw.
+-- As you can see, `actual` and `challenge'` only accept hashed word from rock / paper / scissor.
+-- When the player input other than that, it will return false means that the fund stay locked 
+isChallengerWin :: HashedString -> ClearString -> Bool
+isChallengerWin (HashedString actual) (ClearString challenge') = 
+    if actual == sha2_256 "rock" then
+        if challenge' == "paper" then True else False
+    else if actual == sha2_256 "paper" then
+        if challenge' == "scissor" then True else False
+    else if actual == sha2_256 "scissor" then
+        if challenge' == "rock" then True else False
     else False
 
-grab :: forall w s e. AsContractError e => Contract w s e ()
-grab = do
-    pkh   <- ownPaymentPubKeyHash
-    utxos <- Map.filter (isSuitable pkh) <$> utxosAt scrAddress
-    if Map.null utxos
-        then logInfo @String $ "no utxo available"
-        else do
-            let orefs   = fst <$> Map.toList utxos
-                lookups = Constraints.unspentOutputs utxos  <>
-                        Constraints.otherScript validator
-                tx :: TxConstraints Void Void
-                tx      = mconcat [Constraints.mustSpendScriptOutput oref unitRedeemer | oref <- orefs]
-            ledgerTx <- submitTxConstraintsWith @Void lookups tx
-            void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
-            logInfo @String $ "grab available fund"
-  where
-    isSuitable :: PaymentPubKeyHash -> ChainIndexTxOut -> Bool
-    isSuitable pkh o = case _ciTxOutDatum o of
-        Left _          -> False
-        Right (Datum e) -> case PlutusTx.fromBuiltinData e of
-            Nothing -> False
-            Just d  -> beneficiary d == pkh
+-- | The validator script of the game.
+gameValidator :: Validator
+gameValidator = Scripts.validatorScript gameInstance
 
-endpoints :: Contract () SimpleRpsSchema Text ()
-endpoints = awaitPromise (lock' `select` challenge') >> endpoints
-  where
-    lock' = endpoint @"1.lock" lock
-    challenge' = endpoint @"2.challenge" challenge
+-- | The address of the game (the hash of its validator script)
+gameAddress :: Address
+gameAddress = Ledger.scriptAddress gameValidator
 
-mkSchemaDefinitions ''SimpleRpsSchema
+-- | Parameters for the "lock" endpoint
+data LockParams = LockParams
+    { lockRpsWord :: Haskell.String
+    , amount     :: Value
+    }
+    deriving stock (Haskell.Eq, Haskell.Show, Generic)
+    deriving anyclass (FromJSON, ToJSON, ToSchema, ToArgument)
 
-mkKnownCurrencies []
+--  | Parameters for the "challenge" endpoint
+newtype ChallengeParams = ChallengeParams
+    { challengeWord :: Haskell.String
+    }
+    deriving stock (Haskell.Eq, Haskell.Show, Generic)
+    deriving anyclass (FromJSON, ToJSON, ToSchema, ToArgument)
+
+-- | The "lock" contract endpoint
+lock :: AsContractError e => Promise () GameSchema e ()
+lock = endpoint @"1. lock" @LockParams $ \(LockParams lockRps amt) -> do
+    logInfo @Haskell.String $ "Pay " <> Haskell.show amt <> " to the script"
+    let tx         = Constraints.mustPayToTheScript (hashString lockRps) amt
+    void (submitTxConstraints gameInstance tx)
+
+-- | The "challenge" contract endpoint
+challenge :: AsContractError e => Promise () GameSchema e ()
+challenge = endpoint @"2. challenge" @ChallengeParams $ \(ChallengeParams theChallenge) -> do
+    -- Wait for script to have a UTxO of a least 1 lovelace
+    logInfo @Haskell.String "Waiting for script to have a UTxO of at least 1 lovelace"
+    utxos <- fundsAtAddressGeq gameAddress (Ada.lovelaceValueOf 1)
+
+    let redeemer = clearString theChallenge
+        tx       = collectFromScript utxos redeemer
+
+    let hashedLockRps = findLockRpsValue utxos
+        isChallengerWon = fmap (`isChallengerWin` redeemer) hashedLockRps == Just True
+    if isChallengerWon
+        then do 
+            logWarn @Haskell.String "Ha! You win!"
+            logInfo @Haskell.String "Submitting transaction to challenger"
+            void (submitTxConstraintsSpending gameInstance utxos tx)
+        else logWarn @Haskell.String "You lose !"
+    
+
+-- | Find the rock paper scissor word in the Datum of the UTxOs
+findLockRpsValue :: Map TxOutRef ChainIndexTxOut -> Maybe HashedString
+findLockRpsValue =
+  listToMaybe . catMaybes . Map.elems . Map.map lockRpsValue
+
+-- | Extract the lock rock paper scissor word in the Datum of a given transaction output is possible
+lockRpsValue :: ChainIndexTxOut -> Maybe HashedString
+lockRpsValue o = do
+  Datum d <- either (const Nothing) Just (_ciTxOutDatum o)
+  PlutusTx.fromBuiltinData d
+
+game :: AsContractError e => Contract () GameSchema e ()
+game = do
+    logInfo @Haskell.String "Waiting for challenge or lock endpoint..."
+    selectList [lock, challenge]
+
+endpoints :: AsContractError e => Contract () GameSchema e ()
+endpoints = game
+
+mkSchemaDefinitions ''GameSchema
+
+$(mkKnownCurrencies [])
